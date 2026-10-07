@@ -24,13 +24,13 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
-from vllm.v1.worker.gpu.spec_decode.autoregressive import (
+from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import (
     cudagraph_utils as spec_cudagraph_utils,
 )
-from vllm.v1.worker.gpu.spec_decode.autoregressive import (
+from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import (
     speculator as spec_module,
 )
-from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
 
@@ -488,7 +488,7 @@ def test_draft_prefill_matches_shared_target_metadata_shape(
         input_buffers=None,
         _copy_request_inputs=lambda *a, **kw: None,
     )
-    spec_module.AutoRegressiveSpeculator.init_cudagraph_manager(
+    spec_module.TargetDependentARSpeculator.init_cudagraph_manager(
         speculator, CUDAGraphMode.FULL_AND_PIECEWISE
     )
     speculator.prefill_cudagraph_manager._graphs_captured = True
@@ -513,7 +513,7 @@ def test_draft_prefill_matches_shared_target_metadata_shape(
 
     monkeypatch.setattr(spec_module, "dispatch_cg_and_sync_dp", stop_after_dispatch)
     with pytest.raises(Dispatched) as result:
-        spec_module.AutoRegressiveSpeculator.propose(
+        spec_module.TargetDependentARSpeculator.propose(
             speculator,
             batch,
             {},
