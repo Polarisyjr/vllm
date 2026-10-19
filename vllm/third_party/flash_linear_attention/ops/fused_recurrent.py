@@ -262,7 +262,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     o,
     h0,
     ht,
-    ssm_state_indices,
+    ssm_state_read_indices,
+    ssm_state_write_indices,
     scale,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
@@ -293,16 +294,21 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     mask_v = o_v < V
     mask_h = mask_v[:, None] & mask_k[None, :]
 
-    state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+    read_state_idx = tl.load(
+        ssm_state_read_indices + i_n * stride_indices_seq
+    ).to(tl.int64)
+    write_state_idx = tl.load(
+        ssm_state_write_indices + i_n * stride_indices_seq
+    ).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + o_v
 
-    # Skip if state index is invalid (NULL_BLOCK_ID=0)
-    if state_idx <= 0:
+    # Skip if either state index is invalid (NULL_BLOCK_ID=0)
+    if read_state_idx <= 0 or write_state_idx <= 0:
         zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
         tl.store(p_o, zero, mask=mask_v)
         return
 
-    p_h0 = h0 + state_idx * stride_init_state_token
+    p_h0 = h0 + read_state_idx * stride_init_state_token
     p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
     b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
@@ -335,7 +341,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     b_o = tl.sum(b_h * b_q[None, :], 1)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-    p_ht = ht + state_idx * stride_final_state_token
+    p_ht = ht + write_state_idx * stride_final_state_token
     p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
@@ -351,7 +357,12 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    final_state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # `ssm_state_indices` selects the state to read; `final_state_indices`
+    # (default: the same) selects where the updated state is stored.
+    if final_state_indices is None:
+        final_state_indices = ssm_state_indices
     if mixed_qkv.ndim != 2:
         raise ValueError(
             f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
@@ -372,6 +383,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"`ssm_state_indices` must be 1D for packed decode (got ndim={ssm_state_indices.ndim})."
         )
+    if final_state_indices.ndim != 1:
+        raise ValueError(
+            "`final_state_indices` must be 1D for packed decode "
+            f"(got ndim={final_state_indices.ndim})."
+        )
     if not out.is_contiguous():
         raise ValueError("`out` must be contiguous.")
 
@@ -384,6 +400,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         or initial_state.device != dev
         or out.device != dev
         or ssm_state_indices.device != dev
+        or final_state_indices.device != dev
     ):
         raise ValueError("All inputs must be on the same device.")
 
@@ -396,6 +413,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     if ssm_state_indices.shape[0] != B:
         raise ValueError(
             f"`ssm_state_indices` must have shape [B] (got {tuple(ssm_state_indices.shape)}; expected ({B},))."
+        )
+    if final_state_indices.shape[0] != B:
+        raise ValueError(
+            "`final_state_indices` must have shape [B] "
+            f"(got {tuple(final_state_indices.shape)}; expected ({B},))."
         )
 
     if initial_state.ndim != 4:
@@ -462,7 +484,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         o=out,
         h0=initial_state,
         ht=initial_state,
-        ssm_state_indices=ssm_state_indices,
+        ssm_state_read_indices=ssm_state_indices,
+        ssm_state_write_indices=final_state_indices,
         scale=scale,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,

@@ -105,6 +105,11 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+
+def _vision_tower_skipped(vllm_config: VllmConfig) -> bool:
+    mm_config = vllm_config.model_config.get_multimodal_config()
+    return all(mm_config.get_limit_per_prompt(m) == 0 for m in ("image", "video"))
+
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
@@ -513,11 +518,18 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
+            # Language-only (e.g. a Qwen3.5 draft model): the tower is replaced
+            # by a StageMissingLayer anyway, so skip building it; its TP head
+            # split can fail (0.8B: 12 vision heads at TP8) even on meta.
+            self.visual = (
+                nn.Module()
+                if _vision_tower_skipped(vllm_config)
+                else Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
             )
 
         with self._mark_language_model(vllm_config):
@@ -735,11 +747,18 @@ class Qwen3_5MoeForConditionalGeneration(
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
+            # Language-only (e.g. a Qwen3.5 draft model): the tower is replaced
+            # by a StageMissingLayer anyway, so skip building it; its TP head
+            # split can fail (0.8B: 12 vision heads at TP8) even on meta.
+            self.visual = (
+                nn.Module()
+                if _vision_tower_skipped(vllm_config)
+                else Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
             )
 
         with self._mark_language_model(vllm_config):

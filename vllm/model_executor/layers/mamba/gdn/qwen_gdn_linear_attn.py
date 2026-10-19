@@ -1639,6 +1639,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ):
         """Core attention computation with a packed non-spec decode fast path."""
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        # Standalone hybrid drafters read the state from one slot and write the
+        # updated state to another (transactional state ring); by default the
+        # update is in place.
+        read_state_indices_tensor = attn_metadata.non_spec_state_read_indices_tensor
+        separate_rw = read_state_indices_tensor is not None
+        if read_state_indices_tensor is None:
+            read_state_indices_tensor = non_spec_state_indices_tensor
         self_kv_cache = self.kv_cache
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
@@ -1657,15 +1664,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        mixed_qkv_non_spec = causal_conv1d_update(
-            mixed_qkv,
-            conv_state,
-            conv_weights,
-            self.conv1d.bias,
-            self.activation,
-            conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
-            validate_data=False,
-        )
+        if separate_rw:
+            # Cross-block conv update: read the window from the source slot,
+            # store the shifted window into the destination slot (the APC
+            # kernel path with a 2-column block table per request).
+            read_idx = read_state_indices_tensor[:num_actual_tokens]  # type: ignore[index]
+            write_idx = non_spec_state_indices_tensor[:num_actual_tokens]  # type: ignore[index]
+            mixed_qkv_non_spec = causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=torch.stack((read_idx, write_idx), dim=1),
+                initial_state_idx=torch.zeros_like(read_idx),
+                block_idx_last_scheduled_token=torch.ones_like(write_idx),
+                validate_data=False,
+            )
+        else:
+            mixed_qkv_non_spec = causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+                validate_data=False,
+            )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
@@ -1676,7 +1701,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             scale=self.head_k_dim**-0.5,
             initial_state=ssm_state,
             out=out_buf,
-            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+            ssm_state_indices=read_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+            final_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
         )
         return

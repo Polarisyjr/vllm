@@ -1113,6 +1113,12 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
+        # Remember whether a standalone draft model was explicitly requested.
+        # Hybrid full checkpoints (e.g. Qwen3.5) also ship native MTP layers and
+        # hf_config_override rewrites their config into the MTP head; an explicit
+        # method="draft_model" must keep the full model instead.
+        explicit_draft_model = self.method == "draft_model"
+
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -1273,6 +1279,15 @@ class SpeculativeConfig:
                 draft_hf_overrides: HfOverrides
                 if self.method == "medusa":
                     draft_hf_overrides = {"model_type": "medusa"}
+                elif explicit_draft_model:
+                    # Native-MTP auto-detection is implemented as an HF-config
+                    # rewrite (hf_config_override). Skip it for an explicit
+                    # standalone draft model, keeping only a callable target
+                    # transform if there is one.
+                    target_hf_overrides = self.target_model_config.hf_overrides
+                    draft_hf_overrides = (
+                        target_hf_overrides if callable(target_hf_overrides) else {}
+                    )
                 else:
                     # Compose any callable hf_overrides set on the target so the
                     # draft config receives the same transform (e.g. the test
@@ -1304,6 +1319,10 @@ class SpeculativeConfig:
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
+                    # A standalone draft model never receives the target's
+                    # multimodal embeddings, so a multimodal draft checkpoint
+                    # (e.g. Qwen3.5) only needs its language model.
+                    language_model_only=explicit_draft_model,
                 )
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
@@ -1351,8 +1370,10 @@ class SpeculativeConfig:
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
                     self.method = "mlp_speculator"
-                elif self.draft_model_config.hf_config.model_type in get_args(
-                    MTPModelTypes
+                elif (
+                    not explicit_draft_model
+                    and self.draft_model_config.hf_config.model_type
+                    in get_args(MTPModelTypes)
                 ):
                     self.method = "mtp"
                     if (

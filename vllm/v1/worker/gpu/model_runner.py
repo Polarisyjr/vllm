@@ -647,6 +647,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
+        # Per-step attention metadata is only needed for layers the target
+        # forward runs. A standalone draft model builds metadata for its own
+        # layers inside the speculator, so skip groups made of draft layers.
+        self.step_attn_groups = self.attn_groups
+        from vllm.v1.worker.gpu.spec_decode.draft_model.speculator import (
+            PlainDraftModelSpeculator,
+        )
+
+        # Only for standalone draft models: EAGLE/MTP/DFlash speculators reuse
+        # the target's attention metadata for their own layers.
+        if draft_attn_layer_names and isinstance(
+            self.speculator, PlainDraftModelSpeculator
+        ):
+            self.step_attn_groups = [
+                [g for g in groups if not set(g.layer_names) <= draft_attn_layer_names]
+                for groups in self.attn_groups
+            ]
         # The speculator clears the flag at load time when the checkpoint has
         # no confidence head, so it holds the effective value.
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
@@ -818,11 +835,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs = min(
                 num_reqs, self.max_num_tokens // self.speculator.num_query_per_req
             )
-            num_tokens = min(
-                num_tokens,
-                self.max_num_tokens
-                - num_reqs * self.speculator.num_extra_query_per_req,
-            )
+            # Profile with the largest TARGET batch the scheduler can emit: its
+            # budget is max_num_tokens minus one correction slot per request in
+            # the batch, so a single long prefill chunk carries
+            # max_num_tokens - num_extra_query_per_req target tokens. Sizing the
+            # profile run with max_num_reqs slots instead (256 fewer tokens at
+            # the 2048 default) locks per-token workspaces (MoE) too small and a
+            # later chunk of 2047 tokens dies with "Workspace is locked but
+            # allocation ... requires ...". The expanded draft buffers hold
+            # max_num_tokens + max_num_reqs, so num_reqs extra slots still fit.
+            extra = (self.speculator.num_extra_query_per_req if is_profile
+                     else num_reqs * self.speculator.num_extra_query_per_req)
+            num_tokens = min(num_tokens, self.max_num_tokens - extra)
 
         # Distribute the remainder evenly so no dummy request exceeds
         # ceil(num_tokens / num_reqs) <= max_model_len tokens.
@@ -1859,7 +1883,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mappings, self.kv_cache_config
             )
             assert block_tables is not None
-            attn_groups = self.attn_groups
+            attn_groups = getattr(self, "step_attn_groups", self.attn_groups)
             if dummy_run and is_profile:
                 # Mamba layers take a cheap warmup path with no metadata;
                 # attention metadata is still built so those kernels tune.

@@ -61,6 +61,13 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
 
         return EagleSpeculator(vllm_config, device)
     elif speculative_config.uses_draft_model():
+        if speculative_config.draft_model_config.is_hybrid:
+            # Draft models with recurrent (GDN) layers need state rollback.
+            from vllm.v1.worker.gpu.spec_decode.draft_model.hybrid_speculator import (
+                HybridDraftModelSpeculator,
+            )
+
+            return HybridDraftModelSpeculator(vllm_config, device)
         from vllm.v1.worker.gpu.spec_decode.draft_model.speculator import (
             PlainDraftModelSpeculator,
         )

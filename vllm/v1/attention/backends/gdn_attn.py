@@ -59,6 +59,10 @@ class GDNAttentionMetadata:
     non_spec_state_indices_tensor: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes,]
     )
+    # Optional source state for one-token non-spec decode transitions (used by
+    # the standalone hybrid draft model's state ring). When None, the state is
+    # read from and written to non_spec_state_indices_tensor in place.
+    non_spec_state_read_indices_tensor: torch.Tensor | None = None
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_sequence_masks_cpu: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
