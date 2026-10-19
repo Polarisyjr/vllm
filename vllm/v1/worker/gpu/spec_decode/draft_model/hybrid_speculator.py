@@ -105,7 +105,13 @@ class HybridDraftModelSpeculator(PlainDraftModelSpeculator):
         self._ring_write_cols = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
-        self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+        self.ring_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        # The GDN builders size their state indices from num_speculative_tokens;
+        # the plain speculator's widened view is for attention-only drafters.
+        return self.vllm_config
 
     # ------------------------------------------------------- cuda graphs
 
@@ -115,12 +121,12 @@ class HybridDraftModelSpeculator(PlainDraftModelSpeculator):
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
             cudagraph_mode = CUDAGraphMode.NONE
-        self.decode_cudagraph_manager = SpeculatorCudaGraphManager(
+        self.ring_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config, self.device, cudagraph_mode, decode_query_len=1
         )
 
     def capture(self) -> None:
-        if self.decode_cudagraph_manager is None or not self._state_groups:
+        if self.ring_cudagraph_manager is None or not self._state_groups:
             return
         logger.info("Capturing CUDA graphs for the hybrid draft model's draft steps...")
         # Reset indices so stale values from dummy runs cannot index out of
@@ -129,7 +135,7 @@ class HybridDraftModelSpeculator(PlainDraftModelSpeculator):
         self._ring_read_cols.zero_()
         self._ring_write_cols.zero_()
         self.current_draft_step.zero_()
-        self.decode_cudagraph_manager.capture(
+        self.ring_cudagraph_manager.capture(
             self._graph_step,
             self.model_state,
             self.input_buffers,
@@ -358,7 +364,7 @@ class HybridDraftModelSpeculator(PlainDraftModelSpeculator):
         layers take their state indices from the ring-column buffers gathered
         inside the graph, so their metadata is not rebuilt.
         """
-        assert self.decode_cudagraph_manager is not None
+        assert self.ring_cudagraph_manager is not None
         buffers = self.input_buffers
         query_start_loc_np = self.arange_np[: num_rows + 1]
         all_groups = self.attn_groups
@@ -378,7 +384,7 @@ class HybridDraftModelSpeculator(PlainDraftModelSpeculator):
                     seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
                     step=first_step + step,
                 )
-                self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+                self.ring_cudagraph_manager.run_fullgraph(batch_desc)
         finally:
             self.attn_groups = all_groups
 
@@ -395,13 +401,13 @@ class HybridDraftModelSpeculator(PlainDraftModelSpeculator):
 
     def _dispatch(self, num_rows: int, is_profile: bool) -> BatchExecutionDescriptor:
         batch_desc, _ = dispatch_cg_and_sync_dp(
-            self.decode_cudagraph_manager,
+            self.ring_cudagraph_manager,
             num_rows,
             num_rows,
             uniform_token_count=1,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile or self.decode_cudagraph_manager is None,
+            need_eager=is_profile or self.ring_cudagraph_manager is None,
         )
         return batch_desc
 
