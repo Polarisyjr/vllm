@@ -156,6 +156,19 @@ class SpeculativeConfig:
     draft logits to shared tokens only (TLI algorithm). Requires
     method='draft_model'."""
 
+    explicit_draft_model: bool = False
+    """Set when the user asked for method='draft_model' explicitly: the draft
+    checkpoint is then loaded as a standalone model even if vLLM would
+    otherwise rewrite it into an MTP head (e.g. Qwen3.5 checkpoints that ship
+    MTP weights). Derived, not meant to be set directly."""
+
+    disaggregated: bool = False
+    """Run the drafter in a separate process, usually on another GPU (see
+    vllm/v1/spec_decode/remote_proposer.py). Supports method='draft_model',
+    'eagle', 'eagle3' and 'dflash'; requires drafter_endpoint."""
+    drafter_endpoint: str | None = None
+    """host:port of the drafter's control socket when disaggregated=True."""
+
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
     """Maximum size of ngram token window when using Ngram proposer, required
@@ -692,8 +705,13 @@ class SpeculativeConfig:
         return target_hf_overrides(hf_config)
 
     @staticmethod
+    def _identity_hf_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+        return hf_config
+
+    @staticmethod
     def compose_draft_hf_overrides(
         target_hf_overrides: HfOverrides | None,
+        plain_draft_model: bool = False,
     ) -> Callable[[PretrainedConfig], PretrainedConfig]:
         """Build the ``hf_overrides`` for the draft ``ModelConfig``.
 
@@ -710,6 +728,11 @@ class SpeculativeConfig:
         target via ``functools.partial`` over a module-referenceable static
         method instead.
         """
+        if plain_draft_model:
+            # An explicit draft_model keeps the checkpoint's own architecture.
+            if callable(target_hf_overrides):
+                return target_hf_overrides
+            return SpeculativeConfig._identity_hf_override
         if not callable(target_hf_overrides):
             return SpeculativeConfig.hf_config_override
 
@@ -738,6 +761,7 @@ class SpeculativeConfig:
         # can not be detected, it will be considered as the "draft_model" by
         # default.
 
+        self.explicit_draft_model = self.method == "draft_model"
         # infer method from user args
         if self.method is None and SpeculativeConfig._is_custom_proposer_path(
             self.model
@@ -892,7 +916,8 @@ class SpeculativeConfig:
                     # draft config receives the same transform (e.g. the test
                     # shrink). Dict overrides stay target-only.
                     draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
-                        self.target_model_config.hf_overrides
+                        self.target_model_config.hf_overrides,
+                        plain_draft_model=self.explicit_draft_model,
                     )
                 self.draft_model_config = ModelConfig(
                     model=self.model,
@@ -959,8 +984,10 @@ class SpeculativeConfig:
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
                     self.method = "mlp_speculator"
-                elif self.draft_model_config.hf_config.model_type in get_args(
-                    MTPModelTypes
+                elif (
+                    self.draft_model_config.hf_config.model_type
+                    in get_args(MTPModelTypes)
+                    and not self.explicit_draft_model
                 ):
                     self.method = "mtp"
                     if (

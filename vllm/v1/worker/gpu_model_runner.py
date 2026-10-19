@@ -651,11 +651,22 @@ class GPUModelRunner(
 
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.uses_draft_model():
-                self.drafter = DraftModelProposer(
-                    vllm_config=self.vllm_config,
-                    device=self.device,
-                    runner=self,
-                )
+                if self.speculative_config.disaggregated:
+                    from vllm.v1.spec_decode.remote_proposer import (
+                        RemoteDraftModelProposer,
+                    )
+
+                    self.drafter = RemoteDraftModelProposer(
+                        vllm_config=self.vllm_config,
+                        device=self.device,
+                        runner=self,
+                    )
+                else:
+                    self.drafter = DraftModelProposer(
+                        vllm_config=self.vllm_config,
+                        device=self.device,
+                        runner=self,
+                    )
             elif self.speculative_config.use_ngram_gpu():
                 self.drafter = NgramProposerGPU(self.vllm_config, self.device, self)
                 self.num_tokens_no_spec_gpu = torch.zeros(
@@ -678,12 +689,30 @@ class GPUModelRunner(
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
-                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                if self.speculative_config.disaggregated:
+                    from vllm.v1.spec_decode.remote_proposer import (
+                        RemoteDFlashProposer,
+                    )
+
+                    self.drafter = RemoteDFlashProposer(
+                        self.vllm_config, self.device, self
+                    )
+                else:
+                    self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
-                self.drafter = EagleProposer(self.vllm_config, self.device, self)
+                if self.speculative_config.disaggregated:
+                    from vllm.v1.spec_decode.remote_proposer import (
+                        RemoteEagleProposer,
+                    )
+
+                    self.drafter = RemoteEagleProposer(
+                        self.vllm_config, self.device, self
+                    )
+                else:
+                    self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
@@ -2652,7 +2681,9 @@ class GPUModelRunner(
                 ):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
-                else:
+                elif getattr(self.drafter, "kv_cache_gid", kv_cache_gid) == kv_cache_gid:
+                    # A disaggregated draft model mirrors the attention group's
+                    # block table, which is not group 0 for hybrid targets.
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
             if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):

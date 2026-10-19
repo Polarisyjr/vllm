@@ -561,6 +561,14 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+        # A disaggregated drafter mirrors the target's block table and cannot
+        # hold more blocks than its own KV cache; cap the target accordingly.
+        drafter = getattr(self.model_runner, "drafter", None)
+        if drafter is not None and hasattr(drafter, "cap_available_kv_memory"):
+            self.available_kv_cache_memory_bytes = drafter.cap_available_kv_memory(
+                self.available_kv_cache_memory_bytes,
+                self.model_runner.get_kv_cache_spec(),
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
