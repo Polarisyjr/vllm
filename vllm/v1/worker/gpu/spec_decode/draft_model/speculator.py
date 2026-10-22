@@ -323,14 +323,19 @@ class PlainDraftModelSpeculator(DraftModelSpeculator):
     ) -> nn.Module:
         spec = self.speculative_config
         assert spec is not None
-        draft_vllm_config = replace(
-            self.vllm_config,
-            model_config=self.draft_model_config,
-            quant_config=None,
-            parallel_config=replace(
-                spec.draft_parallel_config,
-                rank=self.vllm_config.parallel_config.rank,
-            ),
+        # apply_draft_overrides: e.g. a draft attention backend that differs
+        # from the target's (FLASH_ATTN graphs step 0 FULL, FlashInfer on A100
+        # only graphs single-token decodes).
+        draft_vllm_config = spec.apply_draft_overrides(
+            replace(
+                self.vllm_config,
+                model_config=self.draft_model_config,
+                quant_config=None,
+                parallel_config=replace(
+                    spec.draft_parallel_config,
+                    rank=self.vllm_config.parallel_config.rank,
+                ),
+            )
         )
         with set_model_tag("draft_model"):
             return get_model(

@@ -919,6 +919,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_last_page_len = CpuGpuBuffer(
             max_num_reqs, dtype=torch.int32, device=self.device, pin_memory=False
         )
+        # FULL graphs of uniform spec batches on the native paged prefill: one
+        # fixed-shape wrapper per (padded num_reqs, query len), sharing the
+        # persistent buffers above like the decode graph wrappers.
+        self.use_uniform_prefill_cudagraph = (
+            self.enable_cuda_graph
+            and self._uses_native_uniform_prefill_cudagraph(vllm_config)
+            and type(self).get_cudagraph_support(vllm_config, kv_cache_spec)
+            == AttentionCGSupport.UNIFORM_BATCH
+        )
+        if self.use_uniform_prefill_cudagraph:
+            self._prefill_wrappers_cudagraph: dict[
+                tuple[int, int], BatchPrefillWithPagedKVCacheWrapper
+            ] = {}
+            self._uniform_qo_indptr = torch.zeros(
+                max_num_reqs + 1, dtype=torch.int32, device=self.device
+            )
 
     @property
     def kv_cache_layout(self) -> KVCacheLayout:
@@ -1002,8 +1018,26 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         use_non_causal = vllm_config.attention_config.use_non_causal
         if has_uniform_batch_support and (not use_non_causal or is_xqa_arch):
             return AttentionCGSupport.UNIFORM_BATCH
-        else:
-            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        if len(kv_specs) > 0 and cls._uses_native_uniform_prefill_cudagraph(
+            vllm_config
+        ):
+            # Without the trtllm kernels (e.g. SM80) a uniform spec batch runs
+            # the native paged prefill, graphed through a fixed-shape wrapper
+            # (_get_uniform_prefill_wrapper, fast_plan_uniform_prefill); the
+            # planner takes the mask mode, so non-causal drafts (DFlash) too.
+            return AttentionCGSupport.UNIFORM_BATCH
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+    @staticmethod
+    def _uses_native_uniform_prefill_cudagraph(vllm_config: VllmConfig) -> bool:
+        """Whether uniform multi-token batches get FULL graphs through the
+        native (non-trtllm) paged prefill. Only where no trtllm decode kernel
+        exists, so the trtllm paths keep their own uniform-batch handling."""
+        return (
+            envs.VLLM_FLASHINFER_UNIFORM_PREFILL_CUDAGRAPH
+            and not supports_trtllm_attention(is_prefill=False)
+            and not vllm_config.cache_config.cache_dtype.startswith("nvfp4")
+        )
 
     @override  # type: ignore[misc]
     @classmethod
@@ -1018,6 +1052,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             cls.get_cudagraph_support(vllm_config, kv_cache_spec)
             != AttentionCGSupport.UNIFORM_BATCH
         ):
+            return None
+        # Native uniform prefill graphs are fixed-width (no varlen decode).
+        if cls._uses_native_uniform_prefill_cudagraph(vllm_config):
             return None
         # The kernel selector asserts off the trtllm-capable architectures, so
         # call it only past the gate, as get_cudagraph_support does.
@@ -1272,6 +1309,40 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self._decode_wrapper = decode_wrapper
 
         return decode_wrapper
+
+    def _uniform_prefill_query_len(
+        self, qo_indptr_prefill_cpu: torch.Tensor, num_prefill_tokens: int
+    ) -> int:
+        """Query length q > 1 shared by every request of an all-prefill batch
+        (spec verify, draft step 0), with 0-length rows allowed for the
+        requests a FULL graph pads; 0 when the batch is not like that."""
+        if num_prefill_tokens > self._decode_cudagraph_max_bs:
+            return 0
+        query_lens = qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
+        q = int(query_lens.max())
+        if q <= 1 or not torch.all((query_lens == q) | (query_lens == 0)):
+            return 0
+        return q
+
+    def _get_uniform_prefill_wrapper(
+        self, batch_size: int, query_len: int, causal: bool
+    ) -> BatchPrefillWithPagedKVCacheWrapper:
+        key = (batch_size, query_len, causal)
+        prefill_wrapper = self._prefill_wrappers_cudagraph.get(key)
+        if prefill_wrapper is None:
+            prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._get_workspace_buffer(),
+                get_flashinfer_layout_string(self.kv_cache_layout),
+                use_cuda_graph=True,
+                qo_indptr_buf=self._uniform_qo_indptr[: batch_size + 1],
+                paged_kv_indptr_buf=self.paged_kv_indptr.gpu[: batch_size + 1],
+                paged_kv_indices_buf=self.paged_kv_indices,
+                paged_kv_last_page_len_buf=self.paged_kv_last_page_len.gpu[
+                    :batch_size
+                ],
+            )
+            self._prefill_wrappers_cudagraph[key] = prefill_wrapper
+        return prefill_wrapper
 
     def _get_cascade_wrapper(self):
         if self._cascade_wrapper is None:
@@ -1641,7 +1712,23 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
+                uniform_q_len = (
+                    self._uniform_prefill_query_len(
+                        qo_indptr_prefill_cpu, num_prefill_tokens
+                    )
+                    if self.use_uniform_prefill_cudagraph
+                    and num_decodes == 0
+                    and not self.use_dcp
+                    and not self.has_sinks
+                    else 0
+                )
+                prefill_wrapper = (
+                    self._get_uniform_prefill_wrapper(
+                        num_prefills, uniform_q_len, causal
+                    )
+                    if uniform_q_len
+                    else self._get_prefill_wrapper(causal=attn_metadata.causal)
+                )
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
@@ -1705,26 +1792,53 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_dtype = (
                         FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                     )
-                    prefill_wrapper.plan(
-                        qo_indptr=qo_indptr_prefill_cpu,
-                        paged_kv_indptr=paged_kv_indptr_prefill_cpu,
-                        paged_kv_indices=paged_kv_indices,
-                        paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
-                        seq_lens=kv_lens_prefill_cpu,
-                        num_qo_heads=self.num_qo_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        head_dim_qk=self.head_dim,
-                        page_size=self.page_size,
-                        causal=attn_metadata.causal,
-                        sm_scale=self.sm_scale,
-                        window_left=self.window_left,
-                        logits_soft_cap=self.logits_soft_cap,
-                        q_data_type=self.q_data_type_prefill,
-                        kv_data_type=self.kv_cache_dtype,
-                        o_data_type=o_dtype,
-                        fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
-                    )
+                    if uniform_q_len:
+                        fast_plan_uniform_prefill(
+                            prefill_wrapper,
+                            qo_indptr_cpu=qo_indptr_prefill_cpu,
+                            paged_kv_indptr_cpu=paged_kv_indptr_prefill_cpu,
+                            paged_kv_indices=paged_kv_indices,
+                            paged_kv_last_page_len_cpu=(
+                                paged_kv_last_page_len_prefill_cpu
+                            ),
+                            kv_lens_cpu=kv_lens_prefill_cpu,
+                            num_tokens=num_prefill_tokens,
+                            uniform_q_len=uniform_q_len,
+                            causal=causal,
+                            num_qo_heads=self.num_qo_heads,
+                            num_kv_heads=self.num_kv_heads,
+                            head_dim=self.head_dim,
+                            page_size=self.page_size,
+                            sm_scale=self.sm_scale,
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap,
+                            q_data_type=self.q_data_type_prefill,
+                            kv_data_type=self.kv_cache_dtype,
+                            o_data_type=o_dtype,
+                            fixed_split_size=self.prefill_fixed_split_size,
+                            disable_split_kv=self.disable_split_kv,
+                        )
+                    else:
+                        prefill_wrapper.plan(
+                            qo_indptr=qo_indptr_prefill_cpu,
+                            paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                            paged_kv_indices=paged_kv_indices,
+                            paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
+                            seq_lens=kv_lens_prefill_cpu,
+                            num_qo_heads=self.num_qo_heads,
+                            num_kv_heads=self.num_kv_heads,
+                            head_dim_qk=self.head_dim,
+                            page_size=self.page_size,
+                            causal=attn_metadata.causal,
+                            sm_scale=self.sm_scale,
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap,
+                            q_data_type=self.q_data_type_prefill,
+                            kv_data_type=self.kv_cache_dtype,
+                            o_data_type=o_dtype,
+                            fixed_split_size=self.prefill_fixed_split_size,
+                            disable_split_kv=self.disable_split_kv,
+                        )
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY
@@ -2777,6 +2891,110 @@ def fast_plan_decode(
         fixed_split_size=fixed_split_size,
         disable_split_kv=disable_split_kv,
     )
+
+
+def fast_plan_uniform_prefill(
+    self,  # cuda-graph prefill wrapper from _get_uniform_prefill_wrapper
+    qo_indptr_cpu: torch.Tensor,
+    paged_kv_indptr_cpu: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len_cpu: torch.Tensor,
+    kv_lens_cpu: torch.Tensor,
+    num_tokens: int,
+    uniform_q_len: int,
+    causal: bool,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    sm_scale: float | None = None,
+    window_left: int = -1,
+    logits_soft_cap: float | None = None,
+    q_data_type: str | torch.dtype | None = "float16",
+    kv_data_type: str | torch.dtype | None = None,
+    o_data_type: str | torch.dtype | None = None,
+    fixed_split_size: int = -1,
+    disable_split_kv: bool = False,
+) -> None:
+    """Plan a uniform spec batch (every request uniform_q_len query tokens,
+    except the 0-length rows a FULL graph pads) for graph capture/replay.
+
+    BatchPrefillWithPagedKVCacheWrapper::plan always schedules cuda-graph
+    batches for the ragged worst case (one request holding nearly all rows),
+    which picks 128-row query tiles for a handful of rows per request and
+    sizes the split temporaries for that. The C++ planner also takes
+    uniform_q_len, which sizes tiles for uniform_q_len x GQA-group rows; the
+    planner is given that uniform layout while the device qo_indptr keeps the
+    padded requests empty, so the kernel skips them.
+    """
+    batch_size = len(paged_kv_indptr_cpu) - 1
+    uniform_qo_indptr_cpu = torch.arange(
+        0, (batch_size + 1) * uniform_q_len, uniform_q_len, dtype=torch.int32
+    )
+    if getattr(self, "vllm_first_call", True):
+        # The public plan selects the kernel module and sets the run()
+        # parameters; no split-KV here, so it allocates no split temporaries.
+        self.plan(
+            qo_indptr=uniform_qo_indptr_cpu,
+            paged_kv_indptr=paged_kv_indptr_cpu,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len_cpu,
+            seq_lens=kv_lens_cpu,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            page_size=page_size,
+            causal=causal,
+            sm_scale=sm_scale,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            disable_split_kv=True,
+        )
+        assert self._backend == "fa2", (
+            f"uniform prefill cudagraphs need the fa2 backend, got {self._backend}"
+        )
+        self.vllm_first_call = False
+
+    self._qo_indptr_buf.copy_(qo_indptr_cpu, non_blocking=True)
+    self._paged_kv_indptr_buf.copy_(paged_kv_indptr_cpu, non_blocking=True)
+    self._paged_kv_last_page_len_buf.copy_(
+        paged_kv_last_page_len_cpu, non_blocking=True
+    )
+    # vLLM computes the indices in place in the wrapper's buffer already.
+    if paged_kv_indices.data_ptr() != self._paged_kv_indices_buf.data_ptr():
+        self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+            paged_kv_indices, non_blocking=True
+        )
+    self._kv_lens_buffer[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
+    self._plan_info = self._cached_module.plan(
+        self._float_workspace_buffer,
+        self._int_workspace_buffer,
+        self._pin_memory_int_workspace_buffer,
+        uniform_qo_indptr_cpu,
+        paged_kv_indptr_cpu,
+        kv_lens_cpu,
+        batch_size * uniform_q_len,  # total_num_rows
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        page_size,
+        True,  # enable_cuda_graph
+        head_dim,  # head_dim_qk
+        head_dim,  # head_dim_vo
+        causal,
+        window_left,
+        fixed_split_size,
+        disable_split_kv,
+        0,  # num_colocated_ctas
+        uniform_q_len,
+    )
+    # run() checks q against the token count (padded rows included).
+    self._qo_indptr_last = num_tokens
+    self._max_q_len = uniform_q_len
+    self._max_kv_len = int(kv_lens_cpu.max())
 
 
 @triton.jit
