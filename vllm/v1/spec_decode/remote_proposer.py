@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import socket
 import tempfile
 from dataclasses import dataclass, field
 
@@ -98,6 +99,8 @@ class DrafterHello:
     # UUID of the leader's GPU; a drafter on the same device switches to the
     # CUDA IPC transport.
     device_uuid: str | None = None
+    # Free-form label of this target (drafter-service logs and stats).
+    target_label: str = ""
 
 
 @dataclass
@@ -110,6 +113,11 @@ class DrafterReady:
     # Set for the same-GPU transport: exported shared buffers, the drafter's
     # event handle and the ZMQ endpoints (see IpcChannel).
     ipc: dict | None = None
+    # Drafter service: the drafter keeps its own KV cache per request (keyed
+    # by target_id and request slot), so no block table crosses the wire and
+    # the target's KV cache is not capped. Several targets may share it.
+    owns_kv: bool = False
+    target_id: int = 0
 
 
 @dataclass
@@ -165,6 +173,24 @@ class IpcChannel:
 
 
 @dataclass
+class DrafterLink:
+    """One drafter connection. A target may hold several (comma-separated
+    ``drafter_endpoint``) and binds each request to one of them on first
+    sight (``SamplingParams.extra_args["drafter"]``: endpoint index, or -1 for
+    no drafter; default: the SPECPILOT_DRAFTER_BINDING policy, "0" or "rr")."""
+
+    endpoint: str
+    step_socket: zmq.Socket | None = None
+    comm: PyNcclCommunicator | None = None
+    ipc: IpcChannel | None = None
+    owns_kv: bool = False
+    target_id: int = 0
+    num_blocks: int = 0
+    released: list[int] = field(default_factory=list)
+    num_reqs_bound: int = 0
+
+
+@dataclass
 class StepHeader:
     num_reqs: int
     num_tokens: int
@@ -185,6 +211,12 @@ class StepHeader:
     # first position). Hybrid drafters drop the first token of rows that
     # continue a sequence, which they consumed as the previous step's bonus.
     num_computed_tokens: list[int] | None = None
+    # Drafter service: which target sent the step, the request slots released
+    # since the previous step (the drafter frees their KV) and the slots of
+    # the rows in batch order.
+    target_id: int = 0
+    released_slots: list[int] | None = None
+    req_slots: list[int] | None = None
 
 
 def packed_numel(h: StepHeader) -> int:
@@ -278,6 +310,15 @@ class RemoteDrafterMixin:
         self._is_leader = self._tp.rank_in_group == 0
         self._connected = False
         self._drafter_num_blocks = 0
+        self._owns_kv = False
+        self._target_id = 0
+        self._released_slots: list[int] = []
+        self._links: list[DrafterLink] = []
+        self._req_link: dict[str, int] = {}
+        self._slot_link: dict[int, int] = {}
+        self._row_links: list[int] = []
+        self._rr = 0
+        self._binding = os.environ.get("SPECPILOT_DRAFTER_BINDING", "0")
         self._target_rope_is_neox_style: bool | None = None
         self._zmq_ctx: zmq.Context | None = None
         self._step_socket: zmq.Socket | None = None
@@ -309,8 +350,10 @@ class RemoteDrafterMixin:
         if self._is_leader:
             self._connect()
         # Every rank must take part in the broadcast.
-        self._drafter_num_blocks = self._tp.broadcast_object(
-            self._drafter_num_blocks, src=0
+        self._drafter_num_blocks, self._owns_kv, self._target_id = (
+            self._tp.broadcast_object(
+                (self._drafter_num_blocks, self._owns_kv, self._target_id), src=0
+            )
         )
         self._connected = True
 
@@ -318,6 +361,8 @@ class RemoteDrafterMixin:
         """Cap the target's KV cache memory so it allocates no more blocks
         than the drafter holds (called from the worker's memory profiling)."""
         self._ensure_connected(self._attention_block_size(kv_cache_specs))
+        if self._owns_kv:
+            return available
         # Size the cache the way the worker will, so hybrid targets (whose
         # layers share KV tensors across groups) get the right block count.
         num_blocks = get_kv_cache_configs(
@@ -369,6 +414,8 @@ class RemoteDrafterMixin:
             block_size = groups[self.kv_cache_gid].kv_cache_spec.block_size
         self._ensure_connected(block_size)
         assert block_size == self.block_size, (block_size, self.block_size)
+        if self._owns_kv:
+            return
         if kv_cache_config.num_blocks > self._drafter_num_blocks:
             raise ValueError(
                 f"Target KV cache has {kv_cache_config.num_blocks} blocks but the "
@@ -392,24 +439,76 @@ class RemoteDrafterMixin:
             common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
         )
 
+    def _bind(self, rid: str) -> int:
+        """Drafter link index for a request seen for the first time."""
+        n = len(self._links)
+        choice = None
+        req = self._runner.requests.get(rid)
+        sp = getattr(req, "sampling_params", None)
+        extra = getattr(sp, "extra_args", None) or {}
+        if "drafter" in extra:
+            choice = extra["drafter"]
+            if choice in (None, "none"):
+                choice = -1
+        elif self._binding == "rr":
+            choice = self._rr % n
+            self._rr += 1
+        else:
+            choice = int(self._binding)
+        choice = int(choice)
+        if choice >= n:
+            raise ValueError(f"request {rid} asks for drafter {choice}, only {n} configured")
+        if choice >= 0:
+            self._links[choice].num_reqs_bound += 1
+        return choice
+
     def _request_slots(self, num_reqs: int) -> torch.Tensor:
-        """Stable per-request slot ids for the current batch order."""
+        """Stable per-request slot ids for the current batch order; also
+        records each row's drafter link (binding on first sight) and queues
+        released slots for the link that served them."""
         req_ids = self._runner.input_batch.req_ids[:num_reqs]
         live = set(req_ids)
         for rid in [r for r in self._req_slots if r not in live]:
-            self._free_slots.append(self._req_slots.pop(rid))
+            slot = self._req_slots.pop(rid)
+            self._free_slots.append(slot)
+            self._released_slots.append(slot)
+            li = self._slot_link.pop(slot, 0)
+            self._req_link.pop(rid, None)
+            if self._links and li >= 0:
+                self._links[li].released.append(slot)
         slots = self._slot_buf
+        row_links = []
         for i, rid in enumerate(req_ids):
             slot = self._req_slots.get(rid)
             if slot is None:
                 slot = self._req_slots[rid] = self._free_slots.pop()
+                li = self._bind(rid) if self._links else 0
+                self._req_link[rid] = li
+                self._slot_link[slot] = li
             slots[i] = slot
+            row_links.append(self._req_link.get(rid, 0))
+        self._row_links = row_links
+        self._slots_cpu = slots[:num_reqs].tolist()
         return slots[:num_reqs].to(self.device, non_blocking=True)
 
     # ------------------------------------------------------ connection
 
     def _connect(self) -> None:
-        host, port = self.endpoint.rsplit(":", 1)
+        endpoints = [e.strip() for e in self.endpoint.split(",") if e.strip()]
+        for ep in endpoints:
+            self._links.append(self._connect_one(ep))
+        first = self._links[0]
+        # Compatibility with the single-link code paths (same-GPU IPC).
+        self._comm, self._step_socket, self._ipc = first.comm, first.step_socket, first.ipc
+        self._owns_kv = all(l.owns_kv for l in self._links)
+        if any(l.owns_kv for l in self._links) and not self._owns_kv:
+            raise ValueError("mixing drafter services and block-mirroring drafters")
+        self._target_id = first.target_id
+        self._drafter_num_blocks = min(l.num_blocks for l in self._links)
+        atexit.register(self.shutdown)
+
+    def _connect_one(self, endpoint: str) -> DrafterLink:
+        host, port = endpoint.rsplit(":", 1)
         ctx = zmq.Context()
         control = ctx.socket(zmq.REQ)
         # The drafter loads and captures CUDA graphs before replying.
@@ -427,28 +526,33 @@ class RemoteDrafterMixin:
             num_speculative_tokens=self.num_speculative_tokens,
             target_rope_is_neox_style=self._target_rope_is_neox_style,
             device_uuid=device_uuid(self.device),
+            target_label=f"{os.path.basename(self.vllm_config.model_config.model)}"
+            f"@{socket.gethostname()}:{os.getpid()}",
         )
-        logger.info("Connecting to drafter at %s: %s", self.endpoint, hello)
+        logger.info("Connecting to drafter at %s: %s", endpoint, hello)
         control.send_pyobj(hello)
         try:
             ready: DrafterReady = control.recv_pyobj()
         except zmq.Again as e:
             raise RuntimeError(
-                f"Drafter at {self.endpoint} did not become ready within "
+                f"Drafter at {endpoint} did not become ready within "
                 f"{DRAFTER_READY_TIMEOUT_S} s"
             ) from e
-        self._drafter_num_blocks = ready.num_gpu_blocks
+        link = DrafterLink(endpoint=endpoint, owns_kv=ready.owns_kv,
+                           target_id=ready.target_id, num_blocks=ready.num_gpu_blocks)
         if ready.ipc is not None:
+            if self._links:
+                raise ValueError("the same-GPU IPC drafter must be the only endpoint")
             self._connect_ipc(ctx, control, ready.ipc)
             control.close()
             self._zmq_ctx = ctx
-            atexit.register(self.shutdown)
+            link.ipc = self._ipc
             logger.info(
                 "Drafter at %s shares this GPU: CUDA IPC transport, %d KV blocks",
-                self.endpoint,
+                endpoint,
                 ready.num_gpu_blocks,
             )
-            return
+            return link
         control.close()
 
         step_socket = ctx.socket(zmq.PUSH)
@@ -456,21 +560,23 @@ class RemoteDrafterMixin:
         group = StatelessProcessGroup.create(
             host=host, port=ready.nccl_port, rank=TARGET_RANK, world_size=2
         )
-        self._comm = PyNcclCommunicator(group, device=self.device)
+        comm = PyNcclCommunicator(group, device=self.device)
         # NCCL sets up its transports on the first send/recv in each direction,
         # which costs hundreds of ms; pay that now rather than on the first step.
         warm = torch.zeros(1, dtype=torch.int32, device=self.device)
-        self._comm.send(warm, dst=DRAFTER_RANK)
-        self._comm.recv(warm, src=DRAFTER_RANK)
+        comm.send(warm, dst=DRAFTER_RANK)
+        comm.recv(warm, src=DRAFTER_RANK)
         torch.cuda.synchronize()
         self._zmq_ctx = ctx
-        self._step_socket = step_socket
-        atexit.register(self.shutdown)
+        link.step_socket, link.comm = step_socket, comm
         logger.info(
-            "Drafter at %s is ready with %d KV blocks",
-            self.endpoint,
+            "Drafter at %s is ready with %d KV blocks (owns_kv=%s, target_id=%d)",
+            endpoint,
             ready.num_gpu_blocks,
+            ready.owns_kv,
+            ready.target_id,
         )
+        return link
 
     def _connect_ipc(self, ctx: zmq.Context, control: zmq.Socket, ipc: dict) -> None:
         if self.pass_hidden_states_to_model:
@@ -515,6 +621,37 @@ class RemoteDrafterMixin:
 
     # ------------------------------------------------------ propose
 
+    def _header(self, link: DrafterLink, num_reqs: int, num_tokens: int, k: int,
+                num_block_cols: int, max_query_len: int, max_seq_len: int,
+                has_rejected: bool, qsl_cpu: list[int], num_hidden: int,
+                num_draft_tokens: list[int] | None, num_computed: list[int],
+                req_slots: list[int]) -> StepHeader:
+        released, link.released = link.released, []
+        return StepHeader(
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            num_block_cols=num_block_cols,
+            num_speculative_tokens=k,
+            max_query_len=max_query_len,
+            max_seq_len=max_seq_len,
+            has_rejected=has_rejected,
+            query_start_loc_cpu=qsl_cpu,
+            num_hidden=num_hidden,
+            num_draft_tokens=num_draft_tokens,
+            num_computed_tokens=num_computed,
+            target_id=link.target_id,
+            released_slots=released or None,
+            req_slots=req_slots if link.owns_kv else None,
+        )
+
+    def _send(self, link: DrafterLink, header: StepHeader, buf: torch.Tensor,
+              hidden: torch.Tensor | None) -> None:
+        assert link.comm is not None and link.step_socket is not None
+        link.step_socket.send_pyobj(header)
+        link.comm.send(buf, dst=DRAFTER_RANK)
+        if hidden is not None:
+            link.comm.send(hidden.contiguous(), dst=DRAFTER_RANK)
+
     def propose(
         self,
         num_speculative_tokens: int,
@@ -555,52 +692,106 @@ class RemoteDrafterMixin:
             cad.block_table_tensor.shape[1],
             cdiv(cad.max_seq_len + k + 1, self.block_size),
         )
+        if self._owns_kv:
+            num_block_cols = 0
         send_hidden = self.pass_hidden_states_to_model
-        header = StepHeader(
-            num_reqs=num_reqs,
-            num_tokens=target_token_ids.shape[0],
-            num_block_cols=num_block_cols,
-            num_speculative_tokens=k,
-            max_query_len=cad.max_query_len,
-            max_seq_len=cad.max_seq_len,
-            has_rejected=num_rejected_tokens_gpu is not None,
-            query_start_loc_cpu=cad.query_start_loc_cpu[: num_reqs + 1].tolist(),
-            num_hidden=target_hidden_states.shape[-1] if send_hidden else 0,
-            num_draft_tokens=num_draft_tokens,
-            num_computed_tokens=self._runner.input_batch.num_computed_tokens_cpu[
-                :num_reqs
-            ].tolist(),
-        )
-        buf = pack_step(
-            target_token_ids,
-            target_positions,
-            next_token_ids,
-            cad,
-            num_rejected_tokens_gpu,
-            self._request_slots(num_reqs),
-            num_block_cols,
-        )
+        hidden = target_hidden_states if send_hidden else None
+        num_hidden = target_hidden_states.shape[-1] if send_hidden else 0
+        req_slots = self._request_slots(num_reqs)
+        qsl_cpu = cad.query_start_loc_cpu[: num_reqs + 1].tolist()
+        num_computed = self._runner.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()
         drafts = torch.empty((num_reqs, k), dtype=torch.int64, device=self.device)
-        if self._is_leader and self._ipc is not None:
+        if not self._is_leader:
+            pass
+        elif self._ipc is not None:
+            link = self._links[0]
+            header = self._header(link, num_reqs, target_token_ids.shape[0], k,
+                                  num_block_cols, cad.max_query_len, cad.max_seq_len,
+                                  num_rejected_tokens_gpu is not None, qsl_cpu, 0,
+                                  num_draft_tokens, num_computed, self._slots_cpu)
+            buf = pack_step(target_token_ids, target_positions, next_token_ids, cad,
+                            num_rejected_tokens_gpu, req_slots, num_block_cols)
             self._propose_ipc(header, buf, drafts)
-        elif self._is_leader:
-            assert self._comm is not None and self._step_socket is not None
-            self._step_socket.send_pyobj(header)
-            self._comm.send(buf, dst=DRAFTER_RANK)
-            if send_hidden:
-                assert target_hidden_states.shape[0] == target_token_ids.shape[0]
-                self._comm.send(target_hidden_states.contiguous(), dst=DRAFTER_RANK)
-            if k > 0:
-                self._comm.recv(drafts, src=DRAFTER_RANK)
+        else:
+            groups: dict[int, list[int]] = {}
+            for r, li in enumerate(self._row_links):
+                groups.setdefault(li, []).append(r)
+            if len(groups) == 1 and -1 not in groups:
+                link = self._links[next(iter(groups))]
+                header = self._header(link, num_reqs, target_token_ids.shape[0], k,
+                                      num_block_cols, cad.max_query_len, cad.max_seq_len,
+                                      num_rejected_tokens_gpu is not None, qsl_cpu,
+                                      num_hidden, num_draft_tokens, num_computed,
+                                      self._slots_cpu)
+                buf = pack_step(target_token_ids, target_positions, next_token_ids, cad,
+                                num_rejected_tokens_gpu, req_slots, num_block_cols)
+                self._send(link, header, buf, hidden)
+                if k > 0:
+                    link.comm.recv(drafts, src=DRAFTER_RANK)
+            else:
+                # Rows bound to different drafters (or to none): one sub-step
+                # per drafter, sent before any draft is awaited so the
+                # drafters work in parallel. Unbound rows get filler drafts
+                # (token 0) that the verifier rejects: async scheduling has
+                # already reserved k slots for them.
+                drafts.zero_()
+                pending = []
+                for li, rows in groups.items():
+                    if li < 0:
+                        continue
+                    link = self._links[li]
+                    rows_t = torch.tensor(rows, dtype=torch.int64, device=self.device)
+                    tok_idx = []
+                    sub_qsl = [0]
+                    sub_computed = []
+                    max_q = 0
+                    max_s = 0
+                    for r in rows:
+                        a, b = qsl_cpu[r], qsl_cpu[r + 1]
+                        tok_idx.extend(range(a, b))
+                        sub_qsl.append(sub_qsl[-1] + b - a)
+                        sub_computed.append(num_computed[r])
+                        max_q = max(max_q, b - a)
+                        max_s = max(max_s, num_computed[r] + b - a)
+                    tok_t = torch.tensor(tok_idx, dtype=torch.int64, device=self.device)
+                    sub_qsl_t = torch.tensor(sub_qsl, dtype=torch.int32, device=self.device)
+                    parts = [
+                        target_token_ids[tok_t].to(torch.int32),
+                        target_positions[tok_t].to(torch.int32),
+                        next_token_ids[rows_t].to(torch.int32),
+                        sub_qsl_t,
+                        cad.seq_lens[rows_t].to(torch.int32),
+                    ]
+                    if num_rejected_tokens_gpu is not None:
+                        parts.append(num_rejected_tokens_gpu[rows_t].to(torch.int32))
+                    parts.append(req_slots[rows_t].to(torch.int32))
+                    parts.append(cad.block_table_tensor[rows_t, :num_block_cols].reshape(-1))
+                    buf = torch.cat(parts)
+                    header = self._header(
+                        link, len(rows), len(tok_idx), k, num_block_cols, max_q, max_s,
+                        num_rejected_tokens_gpu is not None, sub_qsl, num_hidden,
+                        [num_draft_tokens[r] for r in rows] if num_draft_tokens else None,
+                        sub_computed, [self._slots_cpu[r] for r in rows])
+                    self._send(link, header, buf,
+                               hidden[tok_t] if hidden is not None else None)
+                    pending.append((link, rows_t))
+                for link, rows_t in pending:
+                    if k > 0:
+                        sub = torch.empty((rows_t.numel(), k), dtype=torch.int64,
+                                          device=self.device)
+                        link.comm.recv(sub, src=DRAFTER_RANK)
+                        drafts[rows_t] = sub
         if k > 0 and self._tp.world_size > 1:
             self._tp.broadcast(drafts, src=0)
         return drafts
 
     def shutdown(self) -> None:
-        if self._step_socket is not None:
-            self._step_socket.send_pyobj(None)
-            self._step_socket.close(linger=1000)
-            self._step_socket = None
+        for link in self._links:
+            if link.step_socket is not None:
+                link.step_socket.send_pyobj(None)
+                link.step_socket.close(linger=1000)
+                link.step_socket = None
+        self._step_socket = None
 
 
 class RemoteDraftModelProposer(RemoteDrafterMixin, DraftModelProposer):
