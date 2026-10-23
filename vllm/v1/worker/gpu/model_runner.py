@@ -282,8 +282,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
 
-        # Draft tokens propagation - for spec-dec + struct outputs.
-        self.draft_tokens_handler = DraftTokensHandler(self.device)
+        # Draft tokens propagation - for spec-dec + struct outputs (or always,
+        # for a drafter service that reads them as its drafts).
+        self.draft_tokens_handler = DraftTokensHandler(
+            self.device,
+            always_copy=bool(
+                self.speculative_config
+                and self.speculative_config.materialize_draft_tokens
+            ),
+        )
 
         self.pcp_manager: pcp.PCPManager | None = None
 
@@ -1144,8 +1151,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Sorted so every TP rank frees request slots in the same order.
         # Features like batch-sharded sampling derive rank request ownership
         # from the slot index.
+        released: list[int] = []
         for req_id in sorted(finished_req_ids):
-            self._remove_request(req_id)
+            req_idx = self.req_states.req_id_to_index.get(req_id)
+            if self._remove_request(req_id):
+                released.append(req_idx)
+        if released and hasattr(self.speculator, "on_requests_removed"):
+            # A remote drafter closes the sessions of these slots.
+            self.speculator.on_requests_removed(released)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:
@@ -1163,6 +1176,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        remote = hasattr(self.speculator, "on_requests_added")
+        released: list[int] = []
+        sessions: list[tuple[int, list[int]]] = []
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
@@ -1170,7 +1186,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.
-            self._remove_request(req_id)
+            old_idx = self.req_states.req_id_to_index.get(req_id)
+            if self._remove_request(req_id) and remote:
+                released.append(old_idx)
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
@@ -1182,6 +1200,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+            if remote:
+                sessions.append((req_index, new_req_data.prefill_token_ids))
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
 
@@ -1213,6 +1233,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
+        if remote and (released or sessions):
+            # A remote drafter opens a session per new request (prompt, or
+            # prompt + replayed outputs after preemption) and closes replaced ones.
+            if released:
+                self.speculator.on_requests_removed(released)
+            if sessions:
+                self.speculator.on_requests_added(sessions)
             self.model_state.apply_staged_writes()
         if self.sampler is not None:
             self.sampler.apply_staged_writes()

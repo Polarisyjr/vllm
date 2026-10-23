@@ -27,8 +27,9 @@ def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
 
 
 class DraftTokensHandler:
-    def __init__(self, device: torch.device | None = None):
+    def __init__(self, device: torch.device | None = None, always_copy: bool = False):
         self.device = device
+        self.always_copy = always_copy
         self.copy_stream = torch.cuda.Stream(device)
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
@@ -42,7 +43,7 @@ class DraftTokensHandler:
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
-        if not input_batch.has_structured_output_reqs:
+        if not input_batch.has_structured_output_reqs and not self.always_copy:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
             self.draft_tokens_np = None

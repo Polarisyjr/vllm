@@ -8,6 +8,11 @@ from vllm.config import VllmConfig
 def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    if speculative_config.disaggregated:
+        # The drafter (draft model or head) runs in a drafter service.
+        from vllm.v1.worker.gpu.spec_decode.remote.speculator import RemoteSpeculator
+
+        return RemoteSpeculator(vllm_config, device)
     if speculative_config.method == "extract_hidden_states":
         from vllm.v1.worker.gpu.spec_decode.extract_hidden_states import (
             ExtractHiddenStatesSpeculator,

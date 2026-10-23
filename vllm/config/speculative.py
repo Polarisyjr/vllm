@@ -444,6 +444,19 @@ class SpeculativeConfig:
     """Override whether MTP iterations reuse the first step's sparse indices.
     If `None`, use the value from the draft model's Hugging Face config."""
 
+    # Disaggregated drafting (drafter service)
+    disaggregated: bool = False
+    """Run the drafter in a drafter service process, usually on another GPU
+    (vllm/v1/worker/gpu/spec_decode/remote). The target keeps no draft
+    weights or draft KV cache; supports method='draft_model', 'eagle3' and
+    'dflash' and requires `drafter_endpoint`."""
+    drafter_endpoint: str | None = None
+    """host:port of the drafter service's control socket."""
+    materialize_draft_tokens: bool = False
+    """Copy the draft tokens to the CPU every step (DraftTokenIds), not only
+    for structured outputs. A drafter service that drafts with its own engine
+    reads them as its drafts."""
+
     # Advanced control
     disable_padded_drafter_batch: bool = False
     """Disable input padding for speculative decoding. If set to True,
