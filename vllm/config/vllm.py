@@ -651,6 +651,9 @@ class VllmConfig:
             # position (no separate bonus query), so it needs exactly
             # num_speculative_tokens lookahead slots.
             return self.num_speculative_tokens
+        if speculative_config.method == "remote":
+            # Drafter engines draft; the target verifies their drafts.
+            return self.num_speculative_tokens
         return 0
 
     @property
@@ -666,6 +669,9 @@ class VllmConfig:
         their own per-method lookahead, so those components cannot drift apart.
         """
         speculative_config = self.speculative_config
+        if speculative_config is not None and speculative_config.method == "remote":
+            # A drafter engine may serve a head, which reads the next token.
+            return 1
         if speculative_config is None or not speculative_config.use_eagle():
             return 0
         if speculative_config.use_multi_module_mtp():
@@ -1558,6 +1564,7 @@ class VllmConfig:
                     and self.speculative_config.method != "draft_model"
                     and self.speculative_config.method != "dspark"
                     and self.speculative_config.method != "dflash"
+                    and self.speculative_config.method != "remote"
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
@@ -1592,6 +1599,7 @@ class VllmConfig:
                 and self.speculative_config.method != "draft_model"
                 and self.speculative_config.method != "dspark"
                 and self.speculative_config.method != "dflash"
+                and self.speculative_config.method != "remote"
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "

@@ -2954,6 +2954,11 @@ class EngineArgs:
             )
 
         if self.enable_prefix_caching is None:
+            # A drafter engine only sees the tokens its target computes, and
+            # a prefix cache hit skips the cached ones.
+            spec = self.speculative_config
+            if isinstance(spec, dict) and spec.get("drafter_endpoint"):
+                default_prefix_caching = False
             self.enable_prefix_caching = default_prefix_caching
 
             logger.debug(

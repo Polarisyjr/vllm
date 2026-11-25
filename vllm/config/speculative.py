@@ -78,6 +78,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "remote",
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
@@ -553,6 +554,28 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
+    drafter_endpoint: str | list[str] | None = None
+    """"host:port" of a drafter engine (`python -m vllm.v1.drafter.serve`) that
+    drafts for this target, or a list of them. The target then loads no drafter
+    and keeps no draft KV cache, and `method` and `model` stay unset (the
+    method becomes "remote"): each engine says what it serves, and the engines
+    of one target may be of different kinds, as long as they draft
+    `num_speculative_tokens` tokens. A request is drafted by one engine: the
+    one its `vllm_xargs` name as "drafter", or else one picked by load."""
+    drafter_hidden_layers: tuple[int, ...] | None = None
+    """Not for the user to set: the layers whose hidden states the target
+    exports for its drafter engines, recorded once the engines have said
+    which ones they read. They shape the target's computation graph."""
+    drafter_timeout: float = 60.0
+    """Seconds without a sign of life from the drafter engine (its link coming
+    up, an answer to a status query) after which this target gives up and
+    exits. The target cannot go on without the engine: its next forward pass
+    is already queued behind the engine's answer. 0 waits forever."""
+    drafter_priority: int = 0
+    """Priority of this target's steps at a drafter engine that runs the
+    "priority" scheduling policy: when a round cannot hold every waiting step,
+    lower values go first, then earlier arrival. Ignored under "fcfs"."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -631,6 +654,8 @@ class SpeculativeConfig:
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
+        if self.method == "remote":
+            factors.append(tuple(self.drafter_hidden_layers or ()))
         if self.method == "dspark":
             factors.append(self.enable_adaptive_verification)
 
@@ -1121,6 +1146,20 @@ class SpeculativeConfig:
         # can not be detected, it will be considered as the "draft_model" by
         # default.
 
+        if self.drafter_endpoint:
+            if self.method not in (None, "remote") or self.model not in (
+                None,
+                "remote",
+            ):
+                raise ValueError(
+                    "With drafter_endpoint the target loads no drafter: leave "
+                    "'method' and 'model' unset, the drafter engines say what "
+                    "they serve."
+                )
+            self.method = self.model = "remote"
+        elif self.method == "remote":
+            raise ValueError("method='remote' requires drafter_endpoint.")
+
         # infer method from user args
         if self.method is None and SpeculativeConfig._is_custom_proposer_path(
             self.model
@@ -1229,6 +1268,12 @@ class SpeculativeConfig:
                 "experimental feature and the proposer interface is subject to "
                 "breaking changes in future vLLM releases."
             )
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "remote":
+            # The drafters live in drafter engines; nothing to load here.
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
             self.draft_model_config = self.target_model_config

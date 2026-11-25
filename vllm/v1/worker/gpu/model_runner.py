@@ -160,6 +160,7 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     get_max_chunk_logits,
 )
+from vllm.v1.worker.gpu.spec_decode.remote.speculator import RemoteSpeculator
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
@@ -281,6 +282,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
+            if isinstance(self.speculator, RemoteSpeculator):
+                # Its drafter engines say whether they read hidden states.
+                self.use_aux_hidden_state_outputs = self.speculator.needs_hidden_states
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -387,7 +391,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                if isinstance(self.speculator, RemoteSpeculator):
+                    self.speculator.set_aux_hidden_state_layers(self.model)
+                else:
+                    set_eagle3_aux_hidden_state_layers(
+                        self.model, self.speculative_config
+                    )
                 if self.use_pp:
                     assert self.speculative_config.method is not None
                     verify_supports_aux_hidden_states_over_pp(
@@ -1099,6 +1108,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        if isinstance(self.speculator, RemoteSpeculator):
+            self.speculator.on_request_removed(req_idx)
         if self.pooling_runner is not None:
             self.pooling_runner.remove_request(req_idx)
         if self.pp_handler is not None:
@@ -1161,6 +1172,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
+            if isinstance(self.speculator, RemoteSpeculator):
+                self.speculator.on_request_added(
+                    req_index,
+                    new_req_data.prefill_token_ids,
+                    new_req_data.num_computed_tokens,
+                    sampling_params,
+                )
 
             if self.pooling_runner is not None:
                 assert new_req_data.pooling_params is not None
@@ -1403,6 +1421,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
             )
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+            if isinstance(self.speculator, RemoteSpeculator):
+                self.speculator.on_step_sized(query_start_loc)
         if num_draft_tokens_per_req is not None:
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
@@ -2327,6 +2347,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # models; the model objects can outlive this runner.
         speculator = getattr(self, "speculator", None)
         if speculator is not None:
+            if isinstance(speculator, RemoteSpeculator):
+                speculator.shutdown()
             if draft_model := getattr(speculator, "model", None):
                 clear_layer_kv_caches(draft_model.modules())
             self.speculator = None
