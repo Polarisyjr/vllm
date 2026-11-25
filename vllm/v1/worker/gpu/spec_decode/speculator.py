@@ -304,6 +304,7 @@ class DraftModelSpeculator(BaseSpeculator):
         causal: bool | Mapping[int, bool] = True,
         dcp_local_seq_lens: torch.Tensor | None = None,
         slot_mappings: torch.Tensor | None = None,
+        max_query_len: int | None = None,
     ) -> dict[str, Any] | None:
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         # A FULL graph replays a captured shape whose padded requests each hold
@@ -321,7 +322,12 @@ class DraftModelSpeculator(BaseSpeculator):
             query_start_loc_np[: num_reqs + 1]
         )
         query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
-        max_query_len = int((query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max())
+        # `max_query_len`: the longest query the batch may hold when its exact
+        # split is only known on the GPU.
+        max_query_len = max(
+            max_query_len or 0,
+            int((query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max()),
+        )
         block_tables = [
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]

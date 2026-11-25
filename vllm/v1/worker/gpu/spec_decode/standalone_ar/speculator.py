@@ -362,6 +362,9 @@ class StandaloneARSpeculator(AutoRegressiveSpeculator):
                 uniform_token_count=uniform_token_count,
                 dp_size=self.dp_size,
                 dp_rank=self.dp_rank,
+                # Varlen graphs (adaptive verification) only take a batch
+                # that states its longest query.
+                max_query_len=None if input_batch.has_prefill else max_query_len + 1,
                 need_eager=is_profile,
             )
             num_tokens_across_dp = (
@@ -393,6 +396,12 @@ class StandaloneARSpeculator(AutoRegressiveSpeculator):
                 seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
                 step=0,
                 slot_mappings=slot_mappings,
+                # The GPU sized the queries; the CPU split is an even one.
+                max_query_len=(
+                    None
+                    if input_batch.max_query_len is None
+                    else input_batch.max_query_len + 1
+                ),
             )
             kv_cache_config = self.kv_cache_config
             assert kv_cache_config is not None
